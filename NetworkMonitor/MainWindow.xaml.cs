@@ -9,6 +9,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Threading;
 
@@ -68,6 +69,15 @@ namespace NetworkMonitor
             _timer.Start();
 
             DataContext = this;
+        }
+
+        private void CheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            if (sender is CheckBox cb)
+            {
+                // 常に最前面
+                this.Topmost = cb.IsChecked ?? false;
+            }
         }
 
         private void ResetNextCheckTime()

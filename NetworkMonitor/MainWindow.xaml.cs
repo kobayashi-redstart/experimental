@@ -1,6 +1,7 @@
 ﻿using LiveCharts;
 using LiveCharts.Wpf;
 using Microsoft.Extensions.Configuration;
+using Serilog;
 using System;
 using System.Configuration;
 using System.Diagnostics;
@@ -27,15 +28,20 @@ namespace NetworkMonitor
 
         public MainWindow()
         {
-            InitializeComponent();
-
             // 設定ファイルをビルド
             var config = new ConfigurationBuilder()
                 .SetBasePath(Directory.GetCurrentDirectory()) // 実行ファイルの場所
                 .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
                 .Build();
+
+            // Logger初期化
+            Log.Logger = new LoggerConfiguration()
+                    .ReadFrom.Configuration(config)
+                    .CreateLogger();
+
+            // 接続先URL
             string url = config["ExternalService:Url"];
-            Debug.WriteLine($"デバッグ用のURL確認: {url}");
+            Log.Information($"接続するURL: {url}");
 
             // ブランクなら異常終了、そうでなければクラス変数に格納
             if (string.IsNullOrWhiteSpace(url))
@@ -46,6 +52,9 @@ namespace NetworkMonitor
                 Environment.Exit(1);
             }
             _url = url;
+
+            // コンポーネント初期化
+            InitializeComponent();
 
             // 初回起動時、現在時刻に指定秒数を足して「目標時刻」を設定
             ResetNextCheckTime();
@@ -103,16 +112,24 @@ namespace NetworkMonitor
                 // リクエストを送信
                 var response = await _httpClient.GetAsync(_url);
                 sw.Stop();
+                Log.Information("Response: {Time}ms, Status: {Status}",
+                                sw.ElapsedMilliseconds, response.StatusCode);
 
                 if (response.IsSuccessStatusCode)
                 {
                     UpdateStatus(true, sw.ElapsedMilliseconds);
                 }
             }
-            catch (Exception)
+            catch (OperationCanceledException)
             {
-                // タイムアウトや接続無効時にここに来る
-                UpdateStatus(false, 1000); // タイムアウトとして1000msで描画
+                // Timeout
+                UpdateStatus(false, 1000);
+                Log.Warning("Timeout");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus(false, 1000);
+                Log.Error(ex, "ERROR");
             }
             finally
             {

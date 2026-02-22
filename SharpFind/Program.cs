@@ -291,9 +291,6 @@ static IEnumerable<FileData> SearchViaIndex(string rootPath, List<string> includ
 
     var conditions = new List<string>();
 
-    // スコープ指定（必須）
-    conditions.Add($"SCOPE='file:{rootPath.Replace("\\", "/")}'");
-
     // サイズ指定があればクエリに含める（DB側でフィルタリング）
     if (largerThan.HasValue) conditions.Add($"System.Size >= {largerThan.Value}");
     if (smallerThan.HasValue) conditions.Add($"System.Size <= {smallerThan.Value}");

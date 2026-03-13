@@ -17,7 +17,8 @@ DateTime? olderThan = null;
 bool detailedList = false;
 bool noIgnoreHidden = false;
 bool useIndexSearch = false;
-string searchRoot = Directory.GetCurrentDirectory();
+string scope = "";
+string currentDir = Directory.GetCurrentDirectory();
 
 // --- 引数の解析 ---
 for (int i = 0; i < args.Length; i++)
@@ -81,6 +82,9 @@ for (int i = 0; i < args.Length; i++)
         case "--use-index":
             useIndexSearch = true;
             break;
+        case "--scope":
+            if (i + 1 < args.Length) scope = args[++i].ToLower();
+            break;
         case "--help":
             ShowHelp();
             return;
@@ -90,6 +94,7 @@ for (int i = 0; i < args.Length; i++)
             return;
         default:
             if (!args[i].StartsWith("-")) searchPatterns.Add(args[i]);
+            else ShowWarning($"未知のオプション '{args[i]}' は無視されます");
             break;
     }
 }
@@ -122,45 +127,49 @@ if (noIgnoreHidden)
     defaultExcludeDirs.Clear();
 }
 
+// SCOPEに許可された値以外が指定された場合は警告して "sub" を採用、それ以外は指定がない場合も "sub" を採用
+if (!string.IsNullOrWhiteSpace(scope) && scope != "all" && scope != "drive" && scope != "sub")
+{
+    ShowWarning($"無効な SCOPE '{scope}', 'sub' で続行します");
+}
+if (string.IsNullOrWhiteSpace(scope) || scope != "all" && scope != "drive" && scope != "sub")
+{
+    scope = "sub";
+}
+
 // インデックスサーチ
 if (useIndexSearch)
 {
     // インデックス検索の実行（サイズとパスキーワードはクエリ内で解決済み）
-    var results = SearchViaIndex(searchRoot, searchPatterns, largerThan, smallerThan, newerThan, olderThan, targetExt);
+    var results = SearchViaIndex(currentDir, searchPatterns, largerThan, smallerThan, newerThan, olderThan, targetExt, scope);
 
     int matchCount = 0;
 
     foreach (var fileData in results)
     {
-        string relativePath = fileData.RelativePath;
-
-        // --- 除外フィルタ（ここだけはC#でやる必要がある） ---
-        // デフォルト除外（.git, bin, obj）
-        if (!noIgnoreHidden)
-        {
-            var segments = relativePath.Split(Path.DirectorySeparatorChar);
-            if (segments.SkipLast(1).Any(s => defaultExcludeDirs.Contains(s))) continue;
-        }
-
-        // カスタム除外 (--exclude)
-        var xComp = excludeIgnoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-        if (excludePatterns.Any(p => relativePath.Contains(p, xComp))) continue;
-
-        // 検索フィルタリング（AND条件：指定されたキーワード全てが含まれている必要がある）
-        var sComp = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-
-        // パターンが空なら常に true、指定があれば「全てに一致」するかを判定
-        bool isMatch = !searchPatterns.Any() || searchPatterns.All(p => relativePath.Contains(p, sComp));
+        // ローカル用のフィルタを再度適用（除外パターンなど、クエリで解決できないもの）
+        // 既に FileData を持っている場合はそれを使う（サイズ・更新日時などを再利用）
+        bool isMatch = ApplyFilters(
+            fileData,
+            null,
+            currentDir,
+            targetExt,
+            defaultExcludeDirs,
+            noIgnoreHidden,
+            excludePatterns,
+            excludeIgnoreCase,
+            searchPatterns,
+            ignoreCase,
+            hasSizeOrDateFilter,
+            largerThan,
+            smallerThan,
+            newerThan,
+            olderThan).HasValue;
 
         if (!isMatch) continue;
 
-        // 更新日時
-        var lastWriteTime = fileData.Modified;
-        if (newerThan.HasValue && lastWriteTime < newerThan.Value) continue;
-        if (olderThan.HasValue && lastWriteTime > olderThan.Value) continue;
-
         // すべてをパスしたものを表示
-        DisplayFile(fileData, detailedList);
+        DisplayFile(fileData, currentDir, detailedList);
 
         // head 判定
         matchCount++;
@@ -169,67 +178,76 @@ if (useIndexSearch)
     return;
 }
 
+// 全ドライブまたはドライブ単位での検索
+if (scope == "all" || scope == "drive")
+{
+    // 全ドライブを対象にするため、論理ドライブをすべて取得してループ回す
+    // ※通常検索の "all" は非常に時間がかかるため、リミットが無い場合は注意が必要
+    var roots = GetSearchRoots(currentDir, scope);
+
+    // 全てのドライブ（ルート）の列挙を一本のストリームに繋げる
+    var allFiles = roots.SelectMany(root =>
+        Directory.EnumerateFiles(root, "*", options)
+    );
+
+    // フィルタとHead（打ち切り）を適用
+    var results = allFiles
+        .Select(file => ApplyFilters(
+            null,
+            file,
+            currentDir,
+            targetExt,
+            defaultExcludeDirs,
+            noIgnoreHidden,
+            excludePatterns,
+            excludeIgnoreCase,
+            searchPatterns,
+            ignoreCase,
+            hasSizeOrDateFilter,
+            largerThan,
+            smallerThan,
+            newerThan,
+            olderThan))
+        .Where(fd => fd.HasValue)
+        .Select(fd => fd.Value)
+        .Take(headLimit ?? int.MaxValue);
+
+    foreach (var fileData in results)
+    {
+        DisplayFile(fileData, currentDir, detailedList);
+    }
+    return;
+}
+
+// カレントディレクトリを検索
 try
 {
-    var files = Directory.EnumerateFiles(searchRoot, "*", options);
+    var files = Directory.EnumerateFiles(currentDir, "*", options);
 
     int matchCount = 0;
 
     foreach (var file in files)
     {
-        // 拡張子
-        if (!string.IsNullOrEmpty(targetExt))
-        {
-            // Path.GetExtension はドットを含む拡張子を返す
-            if (!string.Equals(Path.GetExtension(file), targetExt, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-        }
+        var fileData = ApplyFilters(
+            null,
+            file,
+            currentDir,
+            targetExt,
+            defaultExcludeDirs,
+            noIgnoreHidden,
+            excludePatterns,
+            excludeIgnoreCase,
+            searchPatterns,
+            ignoreCase,
+            hasSizeOrDateFilter,
+            largerThan,
+            smallerThan,
+            newerThan,
+            olderThan);
 
-        string relativePath = Path.GetRelativePath(searchRoot, file);
+        if (!fileData.HasValue) continue;
 
-        // --- デフォルト除外の判定 ---
-        // パスをフォルダ区切りで分解し、いずれかの階層がリストと完全一致するか確認
-        // 例: "src/obj/main.o" -> ["src", "obj", "main.o"]
-        var pathSegments = relativePath.Split(Path.DirectorySeparatorChar);
-
-        // 最後のセグメント（ファイル名）を除いた「親フォルダ群」に除外対象があるか
-        bool isDefaultExcluded = pathSegments.SkipLast(1).Any(segment => defaultExcludeDirs.Contains(segment));
-        if (isDefaultExcluded) continue;
-
-        // 除外フィルタリング（いずれかに一致したら即座に除外、OR条件）
-        var xComp = excludeIgnoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-        if (excludePatterns.Any(p => relativePath.Contains(p, xComp))) continue;
-
-        // 検索フィルタリング（AND条件：指定されたキーワード全てが含まれている必要がある）
-        var sComp = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-
-        // パターンが空なら常に true、指定があれば「全てに一致」するかを判定
-        if (searchPatterns.Count > 0 && !searchPatterns.All(p => relativePath.Contains(p, sComp))) continue;
-
-        FileInfo? fileInfo = null;
-        if (hasSizeOrDateFilter)
-        {
-            fileInfo = new FileInfo(file);
-            // サイズフィルタリング
-            if (largerThan.HasValue && fileInfo.Length < largerThan.Value) continue;
-            if (smallerThan.HasValue && fileInfo.Length > smallerThan.Value) continue;
-
-            // 更新日時
-            var lastWriteTime = fileInfo.LastWriteTime;
-            if (newerThan.HasValue && lastWriteTime < newerThan.Value) continue;
-            if (olderThan.HasValue && lastWriteTime > olderThan.Value) continue;
-        }
-
-        // すべてをパスしたものを表示
-        if (fileInfo == null) fileInfo = new FileInfo(file);
-        DisplayFile(new FileData()
-        {
-            RelativePath = relativePath,
-            Size = fileInfo.Length,
-            Modified = fileInfo.LastWriteTime
-        }, detailedList);
+        DisplayFile(fileData.Value, currentDir, detailedList);
 
         // カウントアップと打ち切り判定
         matchCount++;
@@ -244,6 +262,18 @@ catch (Exception ex)
     Console.WriteLine($"予期せぬエラー: {ex.Message}");
 }
 
+// --- 検索ルートの取得 --- 
+IEnumerable<string> GetSearchRoots(string currentRoot, string scope)
+{
+    return scope switch
+    {
+        "all" => DriveInfo.GetDrives()
+                    .Where(d => d.IsReady && d.DriveType == DriveType.Fixed)
+                    .Select(d => d.Name),
+        "drive" => new[] { Path.GetPathRoot(Path.GetFullPath(currentRoot)) ?? "C:\\" },
+        _ => new[] { currentRoot } // sub
+    };
+}
 
 // --- サイズ解析用のメソッド (Program.cs の下部に追加) ---
 static long? ParseSize(string input)
@@ -282,7 +312,7 @@ static long? ParseSize(string input)
 
 // --- インデックスサーチ ---
 [SupportedOSPlatform("windows")]
-static IEnumerable<FileData> SearchViaIndex(string rootPath, List<string> includePatterns, long? largerThan, long? smallerThan, DateTime? newerThan, DateTime? olderThan, string? targetExt)
+static IEnumerable<FileData> SearchViaIndex(string rootPath, List<string> includePatterns, long? largerThan, long? smallerThan, DateTime? newerThan, DateTime? olderThan, string? targetExt, string scope)
 {
     string connectionString = "Provider=Search.CollatorDSO;Extended Properties='Application=Windows';";
 
@@ -290,6 +320,24 @@ static IEnumerable<FileData> SearchViaIndex(string rootPath, List<string> includ
     connection.Open();
 
     var conditions = new List<string>();
+
+    string fullPathSlash = Path.GetFullPath(rootPath).Replace("\\", "/");
+    string driveRoot = Path.GetPathRoot(fullPathSlash)?.Replace("\\", "/")?.TrimEnd('/') ?? "C:";
+
+    // SCOPEの指定に応じてクエリ条件を追加
+    switch (scope)
+    {
+        case "all":
+            // SCOPEを指定しない（インデックス全域が対象）
+            break;
+        case "drive":
+            conditions.Add($"SCOPE='file:{driveRoot}'");
+            break;
+        case "sub":
+        default:
+            conditions.Add($"SCOPE='file:{fullPathSlash}'");
+            break;
+    }
 
     // サイズ指定があればクエリに含める（DB側でフィルタリング）
     if (largerThan.HasValue) conditions.Add($"System.Size >= {largerThan.Value}");
@@ -335,9 +383,85 @@ static IEnumerable<FileData> SearchViaIndex(string rootPath, List<string> includ
     }
 }
 
+// --- ファイルフィルタの適用 ---
+static FileData? ApplyFilters(
+    FileData? existing,
+    string? filePath,
+    string currentDir,
+    string? targetExt,
+    HashSet<string> defaultExcludeDirs,
+    bool noIgnoreHidden,
+    List<string> excludePatterns,
+    bool excludeIgnoreCase,
+    List<string> searchPatterns,
+    bool ignoreCase,
+    bool hasSizeOrDateFilter,
+    long? largerThan,
+    long? smallerThan,
+    DateTime? newerThan,
+    DateTime? olderThan)
+{
+    // Use provided FileData if available; otherwise construct from filePath
+    FileData data;
+    if (existing != null)
+    {
+        data = existing.Value;
+    }
+    else
+    {
+        if (string.IsNullOrEmpty(filePath)) return null; // cannot construct
+
+        // 拡張子フィルタ will be checked below using filePath
+        var fi = new FileInfo(filePath);
+        data = new FileData(
+            filePath,
+            Path.GetRelativePath(currentDir, filePath),
+            fi.Length,
+            fi.LastWriteTime);
+    }
+
+    // 拡張子フィルタ
+    if (!string.IsNullOrEmpty(targetExt))
+    {
+        if (!string.Equals(Path.GetExtension(data.FullPath), targetExt, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+    }
+
+    string relativePath = data.RelativePath;
+
+    // デフォルト除外の判定
+    if (!noIgnoreHidden)
+    {
+        var pathSegments = relativePath.Split(Path.DirectorySeparatorChar);
+        bool isDefaultExcluded = pathSegments.SkipLast(1).Any(segment => defaultExcludeDirs.Contains(segment));
+        if (isDefaultExcluded) return null;
+    }
+
+    // 除外フィルタリング
+    var xComp = excludeIgnoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+    if (excludePatterns.Any(p => relativePath.Contains(p, xComp))) return null;
+
+    // 検索フィルタリング（AND条件）
+    var sComp = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+    if (searchPatterns.Count > 0 && !searchPatterns.All(p => relativePath.Contains(p, sComp))) return null;
+
+    if (hasSizeOrDateFilter)
+    {
+        if (largerThan.HasValue && data.Size < largerThan.Value) return null;
+        if (smallerThan.HasValue && data.Size > smallerThan.Value) return null;
+
+        var lastWriteTime = data.Modified;
+        if (newerThan.HasValue && lastWriteTime < newerThan.Value) return null;
+        if (olderThan.HasValue && lastWriteTime > olderThan.Value) return null;
+    }
+
+    return data;
+}
 
 // --- ファイル表示 ---
-static void DisplayFile(FileData data, bool detailedList)
+static void DisplayFile(FileData data, string currentDir, bool detailedList)
 {
     // --- 詳細情報の表示 (日付・サイズ) ---
     if (detailedList)
@@ -350,27 +474,46 @@ static void DisplayFile(FileData data, bool detailedList)
     }
 
     // --- パスの色分け表示 ---
-    string relPath = data.RelativePath;
-    int lastSeparator = relPath.LastIndexOf(Path.DirectorySeparatorChar);
+    string path = ResolveDisplayPath(data.FullPath, data.RelativePath, currentDir);
+    int lastSeparator = path.LastIndexOf(Path.DirectorySeparatorChar);
 
     if (lastSeparator >= 0)
     {
         // ディレクトリ部分は暗めのグレー
         Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.Write(relPath.Substring(0, lastSeparator + 1));
+        Console.Write(path.Substring(0, lastSeparator + 1));
 
         // ファイル名は明るい白
         Console.ForegroundColor = ConsoleColor.White;
-        Console.WriteLine(relPath.Substring(lastSeparator + 1));
+        Console.WriteLine(path.Substring(lastSeparator + 1));
     }
     else
     {
         // ルート直下の場合はそのまま白で表示
         Console.ForegroundColor = ConsoleColor.White;
-        Console.WriteLine(relPath);
+        Console.WriteLine(path);
     }
 
     Console.ResetColor(); // 最後に必ず色を戻す
+}
+
+// --- 表示用のパス解決 ---
+static string ResolveDisplayPath(string fullPath, string relPath, string currentDir)
+{
+    // 相対パスが長すぎる(3階層以上の)場合は、絶対パスを表示する
+    string[] parts = relPath.Split(Path.DirectorySeparatorChar);
+    int parentDirCount = 0;
+    foreach (var part in parts)
+    {
+        if (part == "..") parentDirCount++;
+        else break; // 先頭から連続する ".." だけをカウント
+    }
+    if (parentDirCount >= 3)
+    {
+        return fullPath;
+    }
+
+    return relPath;
 }
 
 // --- サイズ表記 ---
@@ -420,6 +563,22 @@ static DateTime? ParseDateTime(string input)
     return null;
 }
 
+// --- 警告メッセージの表示 ---
+static void ShowWarning(string message)
+{
+    try
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.Error.WriteLine($"警告: {message}");
+    }
+    finally
+    {
+        Console.Out.Flush();
+        Console.Error.Flush();
+        Console.ResetColor();
+    }
+}
+
 // --- ヘルプ表示 ---
 static void ShowHelp()
 {
@@ -431,7 +590,7 @@ Usage:
 
   指定された条件を満たすファイルを表示します
   インデックス検索でない場合は、カレントディレクトリをルートとして検索します 
-  デフォルトでは、--head 10 が指定された状態になります
+  デフォルトでは、--head 10, --scope sub が指定された状態になります
 
 Arguments:
   keyword                 検索キーワード --pathと同じ (複数指定時はAND条件)
@@ -439,6 +598,8 @@ Arguments:
 Options:
   -l, --list              詳細表示モード。サイズと更新日時を合わせて表示します
   --use-index             Windows Search インデックスを使用して高速検索を行います
+  --scope <path>          検索の範囲を指定
+                          (sub: 指定パス以下, drive: ドライブ全体, all: 全ドライブ)
   --head <num>            検索結果を指定した件数で打ち切ります
   --no-ignore-hidden      デフォルトで除外される .git, bin, obj 等を含めて表示
   --help                  このヘルプを表示します
